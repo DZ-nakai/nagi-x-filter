@@ -21,3 +21,6 @@ Thumbs.db
 # Env
 .env
 .env.local
+
+# Local-only private notes (never published)
+/.local/
