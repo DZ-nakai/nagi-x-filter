@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         凪 (Nagi) - X Search Filter
 // @namespace    https://github.com/DZ-nakai/nagi-x-filter
-// @version      0.4.0
+// @version      0.4.1
 // @description  ブロック/ミュートしたアカウントをXの検索結果から非表示にする（非公式・API不使用・端末内完結）
 // @author       DZ-nakai
 // @match        https://x.com/*
@@ -49,11 +49,30 @@
 
   // トースト文言の分類キーワード（言語別。必要に応じ追加）。
   // 「追加」=ブロック/ミュート成功、「削除」=その解除。先に解除を判定する。
+  // 注: 追加トーストには「ブロック解除」という取り消しボタンが含まれる（例:
+  //     「ブロックしました。ブロック解除」）。そのため解除判定は「解除しました」で行い、
+  //     取り消しボタンの「ブロック解除」を誤って解除と見なさないようにする。
   const TOAST_KEYWORDS = {
-    remove: [/ブロックを解除/, /ミュートを解除/, /\bunblocked\b/i, /\bunmuted\b/i],
+    remove: [/解除しました/, /\bunblocked\b/i, /\bunmuted\b/i],
     add: [/ブロックしました/, /ミュートしました/, /\byou blocked\b/i, /\byou muted\b/i],
   };
   const RE_HANDLE_IN_TEXT = /@([A-Za-z0-9_]{1,15})/;
+
+  // 成功トーストには handle が含まれないことが多いため、UI上で最後に操作対象に
+  // なったアカウントを記録しておき、トースト検知時に補完する。
+  let lastActionHandle = null;
+  const NON_PROFILE_SEGMENTS = new Set([
+    'home', 'explore', 'search', 'notifications', 'messages', 'settings', 'compose',
+    'i', 'hashtag', 'bookmarks', 'lists', 'jobs', 'tos', 'privacy', 'login', 'logout',
+  ]);
+  /** プロフィールページなら handle を返す（/handle 形式。既知ルートは除外） */
+  function profileHandleFromPath() {
+    const seg = location.pathname.split('/').filter(Boolean);
+    if (seg.length && /^[A-Za-z0-9_]{1,15}$/.test(seg[0]) && !NON_PROFILE_SEGMENTS.has(seg[0].toLowerCase())) {
+      return seg[0].toLowerCase();
+    }
+    return null;
+  }
 
   // ---- 汎用ユーティリティ -----------------------------------------
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -213,10 +232,11 @@
     const isAdd = !isRemove && TOAST_KEYWORDS.add.some((re) => re.test(text));
     if (!isAdd && !isRemove) return;
 
-    const handle = handleFromToast(toast);
+    // トースト自体に handle が無いことが多い（例:「ブロックしました。ブロック解除」）。
+    // その場合は直前に操作対象になったアカウント（lastActionHandle）で補完する。
+    const handle = handleFromToast(toast) || lastActionHandle;
     if (!handle) {
-      // 文言は合致したが handle を取れなかった＝調整が必要。文言を出して報告できるように。
-      console.warn('[nagi] ブロック/ミュート系トーストを検知したが handle 取得失敗:', JSON.stringify(text));
+      console.warn('[nagi] ブロック/ミュート系トーストを検知したが handle を特定できず:', JSON.stringify(text));
       return;
     }
     if (isRemove) {
@@ -224,6 +244,7 @@
     } else if (addToHidden(handle)) {
       console.debug('[nagi] ブロック/ミュートを検知 → リストに追加:', handle);
     }
+    lastActionHandle = null; // 使い終わったらクリア（別トーストへの誤適用を防ぐ）
   }
 
   // ---- 手動リスト操作（最小UI。フルUIは #4） ----------------------
@@ -309,6 +330,33 @@
       }
     });
     observer.observe(document.body, { childList: true, subtree: true });
+
+    // ブロック/ミュート対象の特定用に「最後に操作したアカウント」を記録する。
+    // （成功トーストには handle が含まれないため、クリック文脈から補う）
+    document.addEventListener(
+      'click',
+      (e) => {
+        const t = e.target;
+        if (!t || typeof t.closest !== 'function') return;
+        const tweet = t.closest(SELECTORS.tweet);
+        if (tweet) {
+          const h = tweetHandle(tweet);
+          if (h) lastActionHandle = h;
+          return;
+        }
+        const cell = t.closest(SELECTORS.userCell);
+        if (cell) {
+          const h = extractHandle(cell);
+          if (h) lastActionHandle = h;
+          return;
+        }
+        // ツイート/セル外（メニューや確認ダイアログ等）のクリックでは、
+        // プロフィールページにいればその handle を文脈として補う。
+        const ph = profileHandleFromPath();
+        if (ph) lastActionHandle = ph;
+      },
+      true
+    );
 
     registerMenu();
   }
