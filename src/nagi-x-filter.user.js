@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         凪 (Nagi) - X Search Filter
 // @namespace    https://github.com/DZ-nakai/nagi-x-filter
-// @version      0.2.0
+// @version      0.3.0
 // @description  ブロック/ミュートしたアカウントをXの検索結果から非表示にする（非公式・API不使用・端末内完結）
 // @author       DZ-nakai
 // @match        https://x.com/*
@@ -21,8 +21,8 @@
  *   - 公式APIは叩かない。ログイン済みブラウザのDOMだけで完結する。
  *   - 端末内（GM_setValue）に保持した非表示リストの handle に一致する投稿を、
  *     検索結果（およびTL）からDOM上で非表示にする。
- *   - 一覧の自動収集（設定ページから）は #2 で実装予定。ここ(#1 MVP)では
- *     メニューコマンドによる手動リストで動かす。
+ *   - ブロック/ミュート一覧ページ（/settings/blocked/all, /settings/muted/all）を開くと、
+ *     その画面の UserCell から handle を収集して一括インポートできる（#2）。
  *
  * 注意:
  *   XのDOMはクラス名がランダム化されるため、構造の手がかりには data-testid を使い、
@@ -39,8 +39,18 @@
   const SELECTORS = {
     tweet: 'article[data-testid="tweet"]', // 検索結果・TL共通の1投稿
     userName: '[data-testid="User-Name"]', // 投稿内のユーザー名ブロック（@handleを含む）
-    userCell: '[data-testid="UserCell"]', // ブロック/ミュート一覧ページの各セル（#2で使用）
+    userCell: '[data-testid="UserCell"]', // ブロック/ミュート一覧ページの各セル
   };
+
+  // ブロック/ミュート一覧ページ判定（/settings/blocked..., /settings/muted...）
+  const BLOCK_MUTE_PAGE = /^\/settings\/(blocked|muted)/;
+
+  // ---- 汎用ユーティリティ -----------------------------------------
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  function isBlockOrMuteListPage() {
+    return BLOCK_MUTE_PAGE.test(location.pathname);
+  }
 
   // ---- ストレージユーティリティ -----------------------------------
   /** @returns {Set<string>} 小文字handle集合（'@'なし） */
@@ -114,10 +124,51 @@
     document.querySelectorAll(SELECTORS.tweet).forEach(applyToTweet);
   }
 
-  // ---- ② 設定ページからの自動収集（#2 で実装） --------------------
-  function harvestFromSettingsPage() {
-    // TODO(#2): /settings/blocked/all, /settings/muted/all で UserCell から
-    //           handle を収集し hidden へ追記・保存（無限スクロール追従）。
+  // ---- ② ブロック/ミュート一覧のインポート（#2） ------------------
+  /** いま画面に出ている UserCell から handle を収集。新規追加件数を返す。 */
+  function harvestVisibleCells() {
+    let added = 0;
+    document.querySelectorAll(SELECTORS.userCell).forEach((cell) => {
+      const h = extractHandle(cell);
+      if (h && !hidden.has(h)) {
+        hidden.add(h);
+        added++;
+      }
+    });
+    if (added) saveHiddenHandles(hidden);
+    return added;
+  }
+
+  /**
+   * 一覧ページを自動スクロールしながら全件収集する。
+   * 仮想リストはスクロールしないと全件描画されないため、件数が一定回数
+   * 変化しなくなるまでスクロール→収集を繰り返す。
+   */
+  async function importBlockMuteList() {
+    if (!isBlockOrMuteListPage()) {
+      alert(
+        '凪: ブロック/ミュート済みアカウントの「すべて」ページ\n' +
+          '（設定 → プライバシーと安全 → ブロック/ミュート済みアカウント）で実行してください。'
+      );
+      return;
+    }
+    const before = hidden.size;
+    let lastSize = -1;
+    let stable = 0;
+    for (let i = 0; i < 300 && stable < 4; i++) {
+      harvestVisibleCells();
+      window.scrollTo(0, document.documentElement.scrollHeight);
+      await sleep(600);
+      if (hidden.size === lastSize) {
+        stable++;
+      } else {
+        stable = 0;
+        lastSize = hidden.size;
+      }
+    }
+    harvestVisibleCells();
+    reapplyAll();
+    alert(`凪: インポート完了。${hidden.size - before} 件を追加（合計 ${hidden.size} 件）。`);
   }
 
   // ---- 手動リスト操作（MVP最小UI。フルUIは #4） -------------------
@@ -152,6 +203,7 @@
 
   function registerMenu() {
     if (typeof GM_registerMenuCommand !== 'function') return;
+    GM_registerMenuCommand('凪: この一覧をインポート（ブロック/ミュート設定ページで）', importBlockMuteList);
     GM_registerMenuCommand('凪: 非表示リストに追加', addHandle);
     GM_registerMenuCommand('凪: 非表示リストから削除', removeHandle);
     GM_registerMenuCommand('凪: 非表示リストを表示', showList);
@@ -160,10 +212,13 @@
   // ---- 起動 -------------------------------------------------------
   function start() {
     reapplyAll();
+    if (isBlockOrMuteListPage()) harvestVisibleCells();
 
     // 仮想スクロール（DOMの付け外し）と遅延レンダリングに追従する。
     const observer = new MutationObserver((mutations) => {
       const tweets = new Set();
+      const cells = new Set();
+      const onListPage = isBlockOrMuteListPage();
       for (const m of mutations) {
         for (const node of m.addedNodes) {
           if (node.nodeType !== Node.ELEMENT_NODE) continue;
@@ -172,14 +227,29 @@
           // 既存の投稿の内部に後からhandleが描画されるケースを拾う
           const closest = node.closest?.(SELECTORS.tweet);
           if (closest) tweets.add(closest);
+          // ブロック/ミュート一覧ページではスクロールに合わせて受動的に収集
+          if (onListPage) {
+            if (node.matches?.(SELECTORS.userCell)) cells.add(node);
+            node.querySelectorAll?.(SELECTORS.userCell).forEach((c) => cells.add(c));
+          }
         }
       }
       tweets.forEach(applyToTweet);
+      if (cells.size) {
+        let added = 0;
+        cells.forEach((cell) => {
+          const h = extractHandle(cell);
+          if (h && !hidden.has(h)) {
+            hidden.add(h);
+            added++;
+          }
+        });
+        if (added) saveHiddenHandles(hidden);
+      }
     });
     observer.observe(document.body, { childList: true, subtree: true });
 
     registerMenu();
-    harvestFromSettingsPage();
   }
 
   start();
