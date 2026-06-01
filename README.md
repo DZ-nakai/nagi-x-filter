@@ -41,11 +41,32 @@ X には標準で「ブロックとミュートのアカウントを除外（Rem
 
 ## インストール
 
-> 🚧 MVP 実装中。インストール手順は実装完了後に記載します。
+1. ユーザースクリプトマネージャを入れる
+   - PC: [Tampermonkey](https://www.tampermonkey.net/)（Chrome / Firefox / Edge）
+   - iOS: Safari + [Userscripts](https://apps.apple.com/app/userscripts/id1463298887)
+   - Android: Firefox + [Violentmonkey](https://addons.mozilla.org/firefox/addon/violentmonkey/) / Tampermonkey
+2. 次のファイルを開いてインストール
+   [`src/nagi-x-filter.user.js`](https://github.com/DZ-nakai/nagi-x-filter/raw/main/src/nagi-x-filter.user.js)
+
+## 使い方（MVP）
+
+ユーザースクリプトマネージャのメニューから操作します（Tampermonkey のアイコン →
+スクリプト名のサブメニュー等）。
+
+- **凪: 非表示リストに追加** — `@handle` を入力すると、そのアカウントの投稿を非表示にする
+- **凪: 非表示リストから削除** — 非表示を解除する
+- **凪: 非表示リストを表示** — 現在の非表示リストを確認する
+
+追加した handle の投稿は、検索結果（最新 / 話題）および TL から `display:none` で消えます。
+スクロールで後から読み込まれた投稿にも自動で適用されます。
+
+> 現状の MVP は**手動リスト**で動きます。ブロック / ミュート一覧からの自動収集は
+> [#2](https://github.com/DZ-nakai/nagi-x-filter/issues/2)、編集 UI は
+> [#4](https://github.com/DZ-nakai/nagi-x-filter/issues/4) で対応予定です。
 
 ## ロードマップ
 
-- [ ] 検索結果での DOM フィルタ（MVP）
+- [x] 検索結果での DOM フィルタ（MVP）
 - [ ] 設定ページからのブロック / ミュート一覧の自動収集
 - [ ] モバイル版 X の DOM セレクタ対応
 - [ ] 手動の非表示リスト編集 UI

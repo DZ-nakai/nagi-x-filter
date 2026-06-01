@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         凪 (Nagi) - X Search Filter
 // @namespace    https://github.com/DZ-nakai/nagi-x-filter
-// @version      0.1.0
+// @version      0.2.0
 // @description  ブロック/ミュートしたアカウントをXの検索結果から非表示にする（非公式・API不使用・端末内完結）
 // @author       DZ-nakai
 // @match        https://x.com/*
@@ -9,6 +9,7 @@
 // @run-at       document-idle
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_registerMenuCommand
 // @noframes
 // @license      MIT
 // ==/UserScript==
@@ -18,36 +19,31 @@
  * ------------------------------------------------------------------
  * 方針:
  *   - 公式APIは叩かない。ログイン済みブラウザのDOMだけで完結する。
- *   - ブロック/ミュート一覧ページを開いたとき、その画面からhandleを収集して
- *     端末内（GM_setValue）に保存する。
- *   - 検索結果ページでは、保存済みhandleに一致する投稿をDOMから非表示にする。
+ *   - 端末内（GM_setValue）に保持した非表示リストの handle に一致する投稿を、
+ *     検索結果（およびTL）からDOM上で非表示にする。
+ *   - 一覧の自動収集（設定ページから）は #2 で実装予定。ここ(#1 MVP)では
+ *     メニューコマンドによる手動リストで動かす。
  *
  * 注意:
- *   XのDOMはクラス名がランダム化されるため、構造の手がかりには
- *   data-testid を使う。セレクタは selectors.js 相当として一箇所に集約し、
- *   X側の変更に追従しやすくする。
- *
- * 現状: スケルトン。検索結果の非表示ロジックは TODO で骨組みのみ。
+ *   XのDOMはクラス名がランダム化されるため、構造の手がかりには data-testid を使い、
+ *   セレクタは SELECTORS に集約してX側変更へ追従しやすくする。
  */
 
 (function () {
   'use strict';
 
-  // ---- 設定 / ストレージキー --------------------------------------
+  // ---- ストレージキー ---------------------------------------------
   const STORAGE_KEY = 'nagi:hidden-handles';
 
   // ---- セレクタ集約（X側変更時はここだけ直す） -------------------
   const SELECTORS = {
-    // 検索結果・TL共通の1投稿
-    tweet: 'article[data-testid="tweet"]',
-    // 投稿内のユーザー名ブロック（@handle を含む）
-    userName: '[data-testid="User-Name"]',
-    // ブロック/ミュート一覧ページの各セル
-    userCell: '[data-testid="UserCell"]',
+    tweet: 'article[data-testid="tweet"]', // 検索結果・TL共通の1投稿
+    userName: '[data-testid="User-Name"]', // 投稿内のユーザー名ブロック（@handleを含む）
+    userCell: '[data-testid="UserCell"]', // ブロック/ミュート一覧ページの各セル（#2で使用）
   };
 
   // ---- ストレージユーティリティ -----------------------------------
-  /** @returns {Set<string>} 小文字のhandle集合（'@'なし） */
+  /** @returns {Set<string>} 小文字handle集合（'@'なし） */
   function loadHiddenHandles() {
     const raw = GM_getValue(STORAGE_KEY, '[]');
     try {
@@ -62,63 +58,127 @@
     GM_setValue(STORAGE_KEY, JSON.stringify([...set]));
   }
 
-  // ---- handle抽出 -------------------------------------------------
+  /** メモリ上の非表示リスト（起動時にロード、変更時に都度保存） */
+  const hidden = loadHiddenHandles();
+
+  // ---- handleユーティリティ ---------------------------------------
+  /** 入力文字列を正規化（前後空白・先頭@を除去して小文字化） */
+  function normalizeHandle(input) {
+    return String(input).trim().replace(/^@+/, '').toLowerCase();
+  }
+
   /**
-   * 要素内の最初の @handle を返す（'@'を除いた小文字）。見つからなければ null。
+   * 要素内の最初の @handle を href から返す（'@'なし小文字）。なければ null。
+   * 表示テキストではなくプロフィールリンク href="/handle" を使うのが最も安定。
    * @param {Element} root
    * @returns {string|null}
    */
   function extractHandle(root) {
-    // プロフィールリンク href="/handle" から拾うのが最も安定
     const link = root.querySelector('a[href^="/"][role="link"]');
     if (!link) return null;
     const m = link.getAttribute('href').match(/^\/([A-Za-z0-9_]{1,15})(?:\/|$)/);
     return m ? m[1].toLowerCase() : null;
   }
 
-  // ---- ① 検索結果での非表示 ---------------------------------------
-  const hidden = loadHiddenHandles();
-
-  /** @param {Element} tweet */
-  function applyToTweet(tweet) {
-    if (tweet.dataset.nagiChecked) return;
-    tweet.dataset.nagiChecked = '1';
-
+  // ---- 1投稿の処理 -------------------------------------------------
+  /**
+   * 投稿要素の著者handleを返す。一度取得できたらキャッシュして再計算を避ける。
+   * （レンダリング途中でhandle未確定のことがあるため、取得できるまではキャッシュしない）
+   */
+  function tweetHandle(tweet) {
+    if (tweet.dataset.nagiHandle) return tweet.dataset.nagiHandle;
     const nameBlock = tweet.querySelector(SELECTORS.userName);
     const handle = nameBlock ? extractHandle(nameBlock) : null;
-    if (handle && hidden.has(handle)) {
-      tweet.style.display = 'none';
-      tweet.dataset.nagiHidden = '1';
+    if (handle) tweet.dataset.nagiHandle = handle;
+    return handle;
+  }
+
+  /** 非表示リストに応じて1投稿の表示/非表示を冪等に更新する */
+  function applyToTweet(tweet) {
+    const handle = tweetHandle(tweet);
+    const shouldHide = !!handle && hidden.has(handle);
+    if (shouldHide) {
+      if (tweet.dataset.nagiHidden !== '1') {
+        tweet.style.display = 'none';
+        tweet.dataset.nagiHidden = '1';
+      }
+    } else if (tweet.dataset.nagiHidden === '1') {
+      // リストから外れた等で再表示に戻すケース
+      tweet.style.removeProperty('display');
+      delete tweet.dataset.nagiHidden;
     }
   }
 
-  function scanTweets(root = document) {
-    root.querySelectorAll(SELECTORS.tweet).forEach(applyToTweet);
+  /** 現在DOM上にある全投稿へ再適用（リスト変更時に呼ぶ） */
+  function reapplyAll() {
+    document.querySelectorAll(SELECTORS.tweet).forEach(applyToTweet);
   }
 
-  // ---- ② 設定ページからの収集（TODO） ------------------------------
-  // /settings/blocked/all, /settings/muted/all を開いたときに UserCell から
-  // handle を収集して hidden に追記・保存する。無限スクロールに追従する想定。
+  // ---- ② 設定ページからの自動収集（#2 で実装） --------------------
   function harvestFromSettingsPage() {
-    // TODO: location.pathname を見て対象ページのみ動作させる
-    // TODO: UserCell ごとに extractHandle → hidden.add → saveHiddenHandles
+    // TODO(#2): /settings/blocked/all, /settings/muted/all で UserCell から
+    //           handle を収集し hidden へ追記・保存（無限スクロール追従）。
+  }
+
+  // ---- 手動リスト操作（MVP最小UI。フルUIは #4） -------------------
+  function addHandle() {
+    const input = prompt('凪: 非表示にする @handle を入力（@は省略可）');
+    if (input == null) return;
+    const h = normalizeHandle(input);
+    if (!h) return;
+    hidden.add(h);
+    saveHiddenHandles(hidden);
+    reapplyAll();
+  }
+
+  function removeHandle() {
+    const input = prompt('凪: 非表示を解除する @handle を入力');
+    if (input == null) return;
+    const h = normalizeHandle(input);
+    if (hidden.delete(h)) {
+      saveHiddenHandles(hidden);
+      reapplyAll();
+    }
+  }
+
+  function showList() {
+    const list = [...hidden].sort();
+    alert(
+      list.length
+        ? `凪: 非表示リスト (${list.length})\n` + list.map((h) => '@' + h).join('\n')
+        : '凪: 非表示リストは空です'
+    );
+  }
+
+  function registerMenu() {
+    if (typeof GM_registerMenuCommand !== 'function') return;
+    GM_registerMenuCommand('凪: 非表示リストに追加', addHandle);
+    GM_registerMenuCommand('凪: 非表示リストから削除', removeHandle);
+    GM_registerMenuCommand('凪: 非表示リストを表示', showList);
   }
 
   // ---- 起動 -------------------------------------------------------
   function start() {
-    scanTweets();
+    reapplyAll();
 
+    // 仮想スクロール（DOMの付け外し）と遅延レンダリングに追従する。
     const observer = new MutationObserver((mutations) => {
+      const tweets = new Set();
       for (const m of mutations) {
         for (const node of m.addedNodes) {
           if (node.nodeType !== Node.ELEMENT_NODE) continue;
-          if (node.matches?.(SELECTORS.tweet)) applyToTweet(node);
-          else scanTweets(node);
+          if (node.matches?.(SELECTORS.tweet)) tweets.add(node);
+          node.querySelectorAll?.(SELECTORS.tweet).forEach((t) => tweets.add(t));
+          // 既存の投稿の内部に後からhandleが描画されるケースを拾う
+          const closest = node.closest?.(SELECTORS.tweet);
+          if (closest) tweets.add(closest);
         }
       }
+      tweets.forEach(applyToTweet);
     });
     observer.observe(document.body, { childList: true, subtree: true });
 
+    registerMenu();
     harvestFromSettingsPage();
   }
 
