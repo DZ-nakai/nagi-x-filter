@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         凪 (Nagi) - X Search Filter
 // @namespace    https://github.com/DZ-nakai/nagi-x-filter
-// @version      0.3.0
+// @version      0.4.0
 // @description  ブロック/ミュートしたアカウントをXの検索結果から非表示にする（非公式・API不使用・端末内完結）
 // @author       DZ-nakai
 // @match        https://x.com/*
@@ -21,8 +21,9 @@
  *   - 公式APIは叩かない。ログイン済みブラウザのDOMだけで完結する。
  *   - 端末内（GM_setValue）に保持した非表示リストの handle に一致する投稿を、
  *     検索結果（およびTL）からDOM上で非表示にする。
- *   - ブロック/ミュート一覧ページ（/settings/blocked/all, /settings/muted/all）を開くと、
- *     その画面の UserCell から handle を収集して一括インポートできる（#2）。
+ *   - ブロック/ミュート一覧ページ（/settings/blocked/all 等）から一括インポート（#2）。
+ *   - ブロック/ミュート操作の成功トーストを検知して、その handle を自動で追加（#9）。
+ *     解除トーストを検知したらリストから削除する。
  *
  * 注意:
  *   XのDOMはクラス名がランダム化されるため、構造の手がかりには data-testid を使い、
@@ -40,10 +41,19 @@
     tweet: 'article[data-testid="tweet"]', // 検索結果・TL共通の1投稿
     userName: '[data-testid="User-Name"]', // 投稿内のユーザー名ブロック（@handleを含む）
     userCell: '[data-testid="UserCell"]', // ブロック/ミュート一覧ページの各セル
+    toast: '[data-testid="toast"]', // 操作成功時の通知トースト（#9）
   };
 
   // ブロック/ミュート一覧ページ判定（/settings/blocked..., /settings/muted...）
   const BLOCK_MUTE_PAGE = /^\/settings\/(blocked|muted)/;
+
+  // トースト文言の分類キーワード（言語別。必要に応じ追加）。
+  // 「追加」=ブロック/ミュート成功、「削除」=その解除。先に解除を判定する。
+  const TOAST_KEYWORDS = {
+    remove: [/ブロックを解除/, /ミュートを解除/, /\bunblocked\b/i, /\bunmuted\b/i],
+    add: [/ブロックしました/, /ミュートしました/, /\byou blocked\b/i, /\byou muted\b/i],
+  };
+  const RE_HANDLE_IN_TEXT = /@([A-Za-z0-9_]{1,15})/;
 
   // ---- 汎用ユーティリティ -----------------------------------------
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -88,6 +98,22 @@
     if (!link) return null;
     const m = link.getAttribute('href').match(/^\/([A-Za-z0-9_]{1,15})(?:\/|$)/);
     return m ? m[1].toLowerCase() : null;
+  }
+
+  // ---- リスト操作（共通） -----------------------------------------
+  function addToHidden(handle) {
+    if (!handle || hidden.has(handle)) return false;
+    hidden.add(handle);
+    saveHiddenHandles(hidden);
+    reapplyAll();
+    return true;
+  }
+
+  function removeFromHidden(handle) {
+    if (!hidden.delete(handle)) return false;
+    saveHiddenHandles(hidden);
+    reapplyAll();
+    return true;
   }
 
   // ---- 1投稿の処理 -------------------------------------------------
@@ -171,25 +197,47 @@
     alert(`凪: インポート完了。${hidden.size - before} 件を追加（合計 ${hidden.size} 件）。`);
   }
 
-  // ---- 手動リスト操作（MVP最小UI。フルUIは #4） -------------------
+  // ---- ⑨ ブロック/ミュート操作と同時に自動追加（#9） ---------------
+  /** トースト要素から handle を取り出す（リンク優先、なければテキストの @handle） */
+  function handleFromToast(toast) {
+    const viaLink = extractHandle(toast);
+    if (viaLink) return viaLink;
+    const m = (toast.textContent || '').match(RE_HANDLE_IN_TEXT);
+    return m ? m[1].toLowerCase() : null;
+  }
+
+  /** 成功トーストを分類して、ブロック/ミュートなら追加、解除なら削除する */
+  function processToast(toast) {
+    const text = toast.textContent || '';
+    const isRemove = TOAST_KEYWORDS.remove.some((re) => re.test(text));
+    const isAdd = !isRemove && TOAST_KEYWORDS.add.some((re) => re.test(text));
+    if (!isAdd && !isRemove) return;
+
+    const handle = handleFromToast(toast);
+    if (!handle) {
+      // 文言は合致したが handle を取れなかった＝調整が必要。文言を出して報告できるように。
+      console.warn('[nagi] ブロック/ミュート系トーストを検知したが handle 取得失敗:', JSON.stringify(text));
+      return;
+    }
+    if (isRemove) {
+      if (removeFromHidden(handle)) console.debug('[nagi] 解除を検知 → リストから削除:', handle);
+    } else if (addToHidden(handle)) {
+      console.debug('[nagi] ブロック/ミュートを検知 → リストに追加:', handle);
+    }
+  }
+
+  // ---- 手動リスト操作（最小UI。フルUIは #4） ----------------------
   function addHandle() {
     const input = prompt('凪: 非表示にする @handle を入力（@は省略可）');
     if (input == null) return;
     const h = normalizeHandle(input);
-    if (!h) return;
-    hidden.add(h);
-    saveHiddenHandles(hidden);
-    reapplyAll();
+    if (h) addToHidden(h);
   }
 
   function removeHandle() {
     const input = prompt('凪: 非表示を解除する @handle を入力');
     if (input == null) return;
-    const h = normalizeHandle(input);
-    if (hidden.delete(h)) {
-      saveHiddenHandles(hidden);
-      reapplyAll();
-    }
+    removeFromHidden(normalizeHandle(input));
   }
 
   function showList() {
@@ -218,6 +266,7 @@
     const observer = new MutationObserver((mutations) => {
       const tweets = new Set();
       const cells = new Set();
+      const toasts = new Set();
       const onListPage = isBlockOrMuteListPage();
       for (const m of mutations) {
         for (const node of m.addedNodes) {
@@ -227,14 +276,26 @@
           // 既存の投稿の内部に後からhandleが描画されるケースを拾う
           const closest = node.closest?.(SELECTORS.tweet);
           if (closest) tweets.add(closest);
-          // ブロック/ミュート一覧ページではスクロールに合わせて受動的に収集
+          // ブロック/ミュート操作の成功トースト（#9）
+          if (node.matches?.(SELECTORS.toast)) toasts.add(node);
+          node.querySelectorAll?.(SELECTORS.toast).forEach((t) => toasts.add(t));
+          // ブロック/ミュート一覧ページではスクロールに合わせて受動的に収集（#2）
           if (onListPage) {
             if (node.matches?.(SELECTORS.userCell)) cells.add(node);
             node.querySelectorAll?.(SELECTORS.userCell).forEach((c) => cells.add(c));
           }
         }
       }
+
       tweets.forEach(applyToTweet);
+
+      // トーストはテキスト描画が一瞬遅れることがあるので少し待ってから処理（重複処理は防止）
+      toasts.forEach((t) => {
+        if (t.dataset.nagiToastSeen === '1') return;
+        t.dataset.nagiToastSeen = '1';
+        setTimeout(() => processToast(t), 60);
+      });
+
       if (cells.size) {
         let added = 0;
         cells.forEach((cell) => {
